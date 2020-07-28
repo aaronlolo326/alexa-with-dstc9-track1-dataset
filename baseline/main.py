@@ -22,6 +22,8 @@ from transformers import (
     AutoTokenizer,
     GPT2DoubleHeadsModel,
     GPT2LMHeadModel,
+    BertForMultipleChoice, ##
+    BertTokenizer, ##
     PreTrainedModel,
     PreTrainedTokenizer,
     get_linear_schedule_with_warmup,
@@ -31,6 +33,8 @@ from .dataset import (
     ResponseGenerationDataset,
     KnowledgeSelectionDataset,
     KnowledgeTurnDetectionDataset,
+    KnowledgeSelectionDataset_BertSeqCls, ## 
+    KnowledgeSelectionDataset_BertMC, ##
     SPECIAL_TOKENS
 )
 from .models import GPT2ClsDoubleHeadsModel
@@ -44,7 +48,9 @@ from .utils.model import (
     run_batch_detection,
     run_batch_generation,
     run_batch_selection_train,
-    run_batch_selection_eval
+    run_batch_selection_train_bertMC,
+    run_batch_selection_eval,
+    run_batch_selection_eval_bertMC
 )
 from .utils.data import write_selection_preds, write_detection_preds
 
@@ -62,7 +68,7 @@ def get_classes(task):
     if task.lower() == "generation":
         return ResponseGenerationDataset, GPT2LMHeadModel, run_batch_generation, run_batch_generation
     elif task.lower() == "selection":
-        return KnowledgeSelectionDataset, GPT2DoubleHeadsModel, run_batch_selection_train, run_batch_selection_eval
+        return KnowledgeSelectionDataset_BertMC, BertForMultipleChoice, run_batch_selection_train_bertMC, run_batch_selection_eval_bertMC
     elif task.lower() == "detection":
         return KnowledgeTurnDetectionDataset, GPT2ClsDoubleHeadsModel, run_batch_detection, run_batch_detection
     else:
@@ -220,7 +226,7 @@ def evaluate(args, eval_dataset, model: PreTrainedModel, tokenizer: PreTrainedTo
     all_labels = []
     for batch in tqdm(eval_dataloader, desc="Evaluating", disable=args.local_rank not in [-1, 0]):
         with torch.no_grad():
-            loss, lm_logits, mc_logits, mc_labels = run_batch_fn(args, model, batch)
+            loss, mc_logits, mc_labels = run_batch_fn(args, model, batch)
             if args.task == "detection":
                 mc_logits = mc_logits.sigmoid()
             if args.task in ["selection", "detection"]:

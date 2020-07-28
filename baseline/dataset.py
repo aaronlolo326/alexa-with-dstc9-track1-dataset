@@ -9,6 +9,7 @@ from itertools import chain
 import torch
 
 from tqdm import tqdm
+from pprint import pprint
 
 from .utils.data import (
     pad_ids, truncate_sequences
@@ -22,10 +23,14 @@ logger = logging.getLogger(__name__)
 SPECIAL_TOKENS = {
     "bos_token": "<bos>",
     "eos_token": "<eos>",
-    "pad_token": "<pad>",
+    # "pad_token": "<pad>",
     "additional_special_tokens": ["<speaker1>", "<speaker2>", "<knowledge_sep>", "<knowledge_tag>"],
+    "cls_token": '[CLS]',
+    "sep_token": '[SEP]',
+    "pad_token": '[PAD]'
 }
-SPECIAL_TOKENS_VALUES = ["<bos>", "<eos>", "<pad>", "<speaker1>", "<speaker2>", "<knowledge_sep>", "<knowledge_tag>"]
+SPECIAL_TOKENS_VALUES = ['[UNK]','[PAD]','[CLS]','[SEP]',"<bos>", "<eos>", "<pad>", "<speaker1>", "<speaker2>", "<knowledge_sep>", "<knowledge_tag>"]
+
 
 
 class BaseDataset(torch.utils.data.Dataset):
@@ -273,6 +278,7 @@ class KnowledgeSelectionDataset(BaseDataset):
         instance = {}
 
         sequence = [[self.bos]] + history
+        # edit this to change what utterances to include
         sequence_with_speaker = [
             [self.speaker1 if (len(sequence) - i) % 2 == 0 else self.speaker2] + s
             for i, s in enumerate(sequence[1:])
@@ -367,3 +373,410 @@ class KnowledgeTurnDetectionDataset(BaseDataset):
         labels = torch.tensor(labels).float()
 
         return input_ids, token_type_ids, mc_token_ids, lm_labels, labels, data_info
+        
+        
+        
+        
+class BaseDataset_Bert(torch.utils.data.Dataset):
+    def __init__(self, args, tokenizer, split_type, labels=True, labels_file=None):
+        # when train the model labels==True
+        self.args = args
+        self.dataroot = args.dataroot
+        self.tokenizer = tokenizer
+        self.split_type = split_type
+
+        self.SPECIAL_TOKENS = SPECIAL_TOKENS
+        self.SPECIAL_TOKENS_VALUES = SPECIAL_TOKENS_VALUES
+
+        self.bos = self.tokenizer.convert_tokens_to_ids(self.SPECIAL_TOKENS["bos_token"])
+        self.eos = self.tokenizer.convert_tokens_to_ids(self.SPECIAL_TOKENS["eos_token"])
+        self.pad = self.tokenizer.convert_tokens_to_ids(self.SPECIAL_TOKENS["pad_token"])
+        self.cls= self.tokenizer.convert_tokens_to_ids(self.SPECIAL_TOKENS['cls_token'])
+        self.sep= self.tokenizer.convert_tokens_to_ids(self.SPECIAL_TOKENS['sep_token'])
+#         self.unk= self.tokenizer.convert_tokens_to_ids(self.SPECIAL_TOKENS['UNK_token'])
+
+
+
+        self.speaker1, self.speaker2, self.knowledge_sep, self.knowledge_tag = self.tokenizer.convert_tokens_to_ids(
+            self.SPECIAL_TOKENS["additional_special_tokens"]
+        )
+        self.knowledge_sep_token = self.SPECIAL_TOKENS["additional_special_tokens"][2]
+
+        self.dataset_walker = DatasetWalker(split_type, labels=labels, dataroot=self.dataroot, labels_file=labels_file)
+        self.dialogs = self._prepare_conversations()# get the parsed dialog data from dataset_walker
+        # print("dialogs: ",self.dialogs[0])
+        '''eg.
+          [{'id': 0, 'log': [{'speaker': 'U', 'text': "I'd really like to take my client out to a nice restaurant that serves indian food."}], 'label': None}, 
+          {'id': 1, 'log': [{'speaker': 'U', 'text': "I'd really like to take my client out to a nice restaurant that serves indian food."}, {'speaker': 'S', 'text': 'I show many restaurants that serve Indian food in that price range. What area would you like to travel to?'}, {'speaker': 'U', 'text': 'Indian food is usually vegetarian friendly, right?'}], 'label': None}]
+          '''
+        self.knowledge_reader = KnowledgeReader(self.dataroot, args.knowledge_file)
+        self.knowledge, self.snippets = self._prepare_knowledge()
+
+        self._create_examples()
+
+    def _prepare_conversations(self): ## tokenize the dialog data
+        logger.info("Tokenize and encode the dialog data")
+        tokenized_dialogs = []
+        for i, (log, label) in enumerate(tqdm(self.dataset_walker, disable=self.args.local_rank not in [-1, 0])): # only show progress bar in one process
+            dialog = {}
+            dialog["id"] = i
+            dialog["log"] = log
+            if label is not None:
+                if "response" in label: #this is for task3: generate the response
+                    label["response_tokenized"] = self.tokenizer.convert_tokens_to_ids(
+                        self.tokenizer.tokenize(label["response"])
+                    )
+            dialog["label"] = label
+            tokenized_dialogs.append(dialog)
+        return tokenized_dialogs
+    
+    def _prepare_knowledge(self): ## prepare knowledge snippet
+        knowledge = self.knowledge_reader.knowledge
+        self.knowledge_docs = self.knowledge_reader.get_doc_list()
+
+        tokenized_snippets = dict()
+        for snippet in self.knowledge_docs:
+            key = "{}__{}__{}".format(snippet["domain"], str(snippet["entity_id"]) or "", snippet["doc_id"])
+            knowledge = self._knowledge_to_string(snippet["doc"], name=snippet["entity_name"] or "")
+            tokenized_knowledge = self.tokenizer.convert_tokens_to_ids(self.tokenizer.tokenize(knowledge))
+            tokenized_snippets[key] = tokenized_knowledge[:self.args.knowledge_max_tokens]
+        return knowledge, tokenized_snippets
+
+    def _knowledge_to_string(self, doc, name=""):## return the string if the knowledge
+        return doc["body"]
+
+    def _create_examples(self):
+        logger.info("Creating examples")
+        self.examples = []
+        for dialog in tqdm(self.dialogs, disable=self.args.local_rank not in [-1, 0]):
+            dialog_id = dialog["id"]
+            label = dialog["label"]
+            dialog = dialog["log"]
+            if label is None: ## label is none only when it is evalutation phrase
+
+                # This will only happen when running knowledge-seeking turn detection on test data (evaluation phrase)
+
+                # So we create dummy target here
+                label = {"target": False}
+
+            target = label["target"]
+
+            if not target and self.args.task != "detection":
+                # we only care about non-knowledge-seeking turns in turn detection task
+                continue
+            #only target is False or task == detection then we can go further
+
+            history = [
+                self.tokenizer.convert_tokens_to_ids(self.tokenizer.tokenize(turn["text"]))
+                for turn in dialog 
+            ]#dialog is a conversation, turns are the turns in the conversation, and they will be tokenized
+
+            gt_resp = label.get("response", "")
+            tokenized_gt_resp = self.tokenizer.convert_tokens_to_ids(self.tokenizer.tokenize(gt_resp))
+
+            # apply history threshold at an utterance-level (a large value can be used to nullify its effect)
+            truncated_history = history[-self.args.history_max_utterances:]
+
+            # perform token-level truncation of history from the left 
+            truncated_history = truncate_sequences(truncated_history, self.args.history_max_tokens)#get sum of the history tokens less than history max tokens
+
+            if target:# if target==True (it will only happen in knowledge selection)
+                if "knowledge" not in label:
+                    # when the labels.json is from knowledge-seeking turn detection,
+                    # there will be no ground truth knowledge
+                    # so we just use a dummy snippet here
+                    if not self.args.eval_all_snippets:
+                        raise ValueError("eval_all_snippets is required to be true when taking output from knowledge-seeking turn detection")
+                    label["knowledge"] = [self.knowledge_docs[0]]
+
+                knowledge = label["knowledge"][0]
+                knowledge_key = "{}__{}__{}".format(knowledge["domain"], knowledge["entity_id"], knowledge["doc_id"])
+                # find snippets with same entity as candidates
+                prefix = "{}__{}".format(knowledge["domain"], knowledge["entity_id"])
+                knowledge_candidates = [cand for cand in self.snippets.keys() if cand.startswith(prefix)]
+
+                if self.split_type == "train" and self.args.negative_sample_method == "oracle":
+                    # if there's not enough candidates during training, we just skip this example
+                    if len(knowledge_candidates) < self.args.n_candidates:
+                        continue
+                used_knowledge = self.snippets[knowledge_key]
+                used_knowledge = used_knowledge[:self.args.knowledge_max_tokens]#get the knowledge from the right
+            else:# target==false will happen before detection or knowledge seeking is not needed
+                knowledge_candidates = None
+                used_knowledge = []
+                
+            self.examples.append({
+                "history": truncated_history, #tokenized history
+                "knowledge": used_knowledge, #it is none if target==false
+                "candidates": knowledge_candidates,
+                "response": tokenized_gt_resp,
+                "response_text": gt_resp,
+                "label": label,
+                "knowledge_seeking": target,
+                "dialog_id": dialog_id
+            })
+
+    def build_input_from_segments(self, knowledge, history, response, with_eos=True):
+        """ Build a sequence of input from 3 segments: knowledge, history and last reply """
+        instance = {}
+
+        sequence = [[self.bos] + knowledge] + history + [response + ([self.eos] if with_eos else [])]# bos is the start token and eos is the last token
+        sequence_with_speaker = [
+            [self.speaker1 if (len(sequence) - i) % 2 == 0 else self.speaker2] + s# get the list [[speaker i, sequence]...]
+            for i, s in enumerate(sequence[1:])
+        ]
+        sequence = [sequence[0]] + sequence_with_speaker
+        instance["input_ids"] = list(chain(*sequence))
+        instance["token_type_ids"] = [self.speaker2 if i % 2 else self.speaker1 for i, s in enumerate(sequence) for _ in s]
+        instance["mc_token_ids"] = len(instance["input_ids"]) - 1
+        instance["lm_labels"] = ([-100] * sum(len(s) for s in sequence[:-1])) + [-100] + sequence[-1][1:]
+
+        return instance, sequence
+                
+    def __getitem__(self, index):
+        raise NotImplementedError
+    
+    def __len__(self):
+        return len(self.examples)
+
+
+
+class KnowledgeSelectionDataset_BertMC(BaseDataset_Bert):
+    def __init__(self, args, tokenizer, split_type, labels=True, labels_file=None):
+        super(KnowledgeSelectionDataset_BertMC, self).__init__(args, tokenizer, split_type, labels, labels_file)
+        if self.args.negative_sample_method not in ["all", "mix", "oracle"]:
+            raise ValueError("negative_sample_method must be all, mix, or oracle, got %s" % self.args.negative_sample_method)
+
+    def _knowledge_to_string(self, doc, name=""):
+        join_str = " %s " % self.knowledge_sep_token
+        return join_str.join([name, doc["title"], doc["body"]])
+
+    def __getitem__(self, index):
+        example = self.examples[index]
+
+        this_inst = {
+            "dialog_id": example["dialog_id"],
+            "input_ids": [],
+            "token_type_ids": [],
+            "mc_token_ids": [],
+            "attention_mask": [] ##
+        }
+
+        if self.split_type != "train":
+            # if eval_all_snippets is set, we use all snippets as candidates
+            if self.args.eval_all_snippets:
+                candidates = list(self.snippets.keys())
+            else:
+                candidates = example["candidates"]
+        else:
+            if self.args.negative_sample_method == "all":
+                candidates = list(self.snippets.keys())
+            elif self.args.negative_sample_method == "mix":
+                candidates = example["candidates"] + random.sample(list(self.snippets.keys()), k=len(example["candidates"]))
+            elif self.args.negative_sample_method == "oracle":
+                candidates = example["candidates"]
+            else: # although we have already checked for this, still adding this here to be sure
+                raise ValueError("negative_sample_method must be all, mix, or oracle, got %s" % self.args.negative_sample_method)
+        
+        candidate_keys = candidates
+        this_inst["candidate_keys"] = candidate_keys
+        candidates = [self.snippets[cand_key] for cand_key in candidates]
+
+        if self.split_type == "train":
+            candidates = self._shrink_label_cands(example["knowledge"], candidates)
+
+        label_idx = candidates.index(example["knowledge"])
+            
+        this_inst["label_idx"] = label_idx
+        for cand in candidates:
+            instance, _ = self.build_input_from_segments(
+                cand,
+                example["history"]
+            )
+            this_inst["input_ids"].append(instance["input_ids"])
+            this_inst["token_type_ids"].append(instance["token_type_ids"])
+            #this_inst["mc_token_ids"].append(instance["mc_token_ids"]) ## no need coz it classifies at [CLS]
+            this_inst["attention_mask"].append(instance["attention_mask"])  
+
+        return this_inst
+
+    def build_input_from_segments(self, knowledge, history):
+        """ Build a sequence of input from 2 segments: knowledge and history"""
+        instance = {}
+
+        sequence = [[self.cls]] + history ##
+        sequence_with_speaker = [
+            [self.speaker1 if (len(sequence) - i) % 2 == 0 else self.speaker2] + s
+            for i, s in enumerate(sequence[1:])
+        ]
+        sequence = [sequence[0]] + sequence_with_speaker + [[self.sep] + knowledge] ##
+
+        instance["input_ids"] = list(chain(*sequence))
+        instance["token_type_ids"] = [self.speaker2 if i % 2 else self.speaker1 for i, s in enumerate(sequence[:-1]) for _ in s] + [self.knowledge_tag for _ in sequence[-1]]
+        ## instance["mc_token_ids"] = len(instance["input_ids"]) - 1
+        instance['attention_mask'] =  [1  for _  in instance["input_ids"]] ##
+
+        return instance, sequence
+    
+    def _shrink_label_cands(self, label, candidates):
+        shrunk_label_cands = candidates.copy()
+        shrunk_label_cands.remove(label)
+        shrunk_label_cands = random.sample(shrunk_label_cands, k=self.args.n_candidates-1)
+        shrunk_label_cands.append(label)
+        random.shuffle(shrunk_label_cands)
+
+        return shrunk_label_cands
+
+    def collate_fn(self, batch):
+        input_ids = [ids for ins in batch for ids in ins["input_ids"]]
+        token_type_ids = [ids for ins in batch for ids in ins["token_type_ids"]]
+        ## mc_token_ids = [id for ins in batch for id in ins["mc_token_ids"]]
+        label_idx = [ins["label_idx"] for ins in batch]
+
+        data_info = {
+            "dialog_ids": [ins["dialog_id"] for ins in batch],
+            "candidate_keys": [ins["candidate_keys"] for ins in batch]
+        }
+
+        batch_size = len(batch)
+        n_candidates = len(batch[0]["input_ids"])
+        input_ids = torch.tensor(
+            pad_ids(input_ids, self.pad)
+        ).view(batch_size, n_candidates, -1)
+        
+        token_type_ids = torch.tensor(
+            pad_ids(token_type_ids, self.pad)
+        ).view(batch_size, n_candidates, -1)
+
+        attention_mask = torch.tensor( ## 
+            pad_ids(attention_mask, self.pad) ##
+        ).view(batch_size, n_candidates, -1) ##
+                
+        ## lm_labels = torch.full_like(input_ids, -100)
+        ## mc_token_ids = torch.tensor(mc_token_ids).view(batch_size, n_candidates)
+        label_idx = torch.tensor(label_idx)
+
+        return input_ids, token_type_ids, label_idx, attention_mask, data_info ##
+
+
+
+class KnowledgeSelectionDataset_BertSeqCls(BaseDataset_Bert):
+    def __init__(self, args, tokenizer, split_type, labels=True, labels_file=None):
+        super(KnowledgeSelectionDataset_BertSeqCls, self).__init__(args, tokenizer, split_type, labels, labels_file)
+        if self.args.negative_sample_method not in ["all", "mix", "oracle"]:
+            raise ValueError("negative_sample_method must be all, mix, or oracle, got %s" % self.args.negative_sample_method)
+
+    def _knowledge_to_string(self, doc, name=""):# convert knowledge into string
+        join_str = " %s " % self.knowledge_sep_token
+        return join_str.join([name, doc["title"], doc["body"]])
+
+    def __getitem__(self, index):
+        example = self.examples[index]
+        this_inst = {
+            "dialog_id": example["dialog_id"],
+            "input_ids": [],
+            "token_type_ids": [],
+            # "mc_token_ids": [], # no need cause bertSeqCls by default does BCE at CLS
+            "attention_mask": [] ##
+        }
+
+        if self.split_type != "train":# then it is for evaluation
+            # if eval_all_snippets is set, we use all snippets as candidates
+            if self.args.eval_all_snippets:
+                candidates = list(self.snippets.keys())
+            else:
+                candidates = example["candidates"]
+        else:
+            if self.args.negative_sample_method == "all":
+                candidates = list(self.snippets.keys())
+            elif self.args.negative_sample_method == "mix":
+                candidates = example["candidates"] + random.sample(list(self.snippets.keys()), k=len(example["candidates"]))
+            elif self.args.negative_sample_method == "oracle":
+                candidates = example["candidates"]
+            else: # although we have already checked for this, still adding this here to be sure
+                raise ValueError("negative_sample_method must be all, mix, or oracle, got %s" % self.args.negative_sample_method)
+        
+        candidate_keys = candidates
+        this_inst["candidate_keys"] = candidate_keys
+        candidates = [self.snippets[cand_key] for cand_key in candidates]
+
+        if self.split_type == "train":
+            candidates = self._shrink_label_cands(example["knowledge"], candidates)
+        # label_idx is where the correct knowledge is in the candidates
+        label_idx = candidates.index(example["knowledge"])
+            
+        this_inst["label_idx"] = label_idx
+        for cand in candidates:
+            instance, _ = self.build_input_from_segments(
+                cand,
+                example["history"]
+            )            
+            this_inst["input_ids"].append(instance["input_ids"])
+            this_inst["token_type_ids"].append(instance["token_type_ids"])
+            ## this_inst["mc_token_ids"].append(instance["mc_token_ids"])
+            this_inst["attention_mask"].append(instance["attention_mask"])            
+
+        return this_inst
+
+    def build_input_from_segments(self, knowledge, history):
+        """ Build a sequence of input from 2 segments: knowledge and history"""
+        instance = {}
+
+        sequence = [[self.cls]] + history ##
+        sequence_with_speaker = [
+            [self.speaker1 if (len(sequence) - i) % 2 == 0 else self.speaker2] + s
+            for i, s in enumerate(sequence[1:])
+        ]
+        sequence = [sequence[0]] + sequence_with_speaker + [[self.sep] + knowledge] ##
+
+        instance["input_ids"] = list(chain(*sequence))
+        instance["token_type_ids"] = [self.speaker2 if i % 2 else self.speaker1 for i, s in enumerate(sequence[:-1]) for _ in s] + [self.knowledge_tag for _ in sequence[-1]]
+        ## instance["mc_token_ids"] = len(instance["input_ids"]) - 1
+        instance['attention_mask'] =  [1  for _  in instance["input_ids"]] ##
+        
+        return instance, sequence
+    
+    def _shrink_label_cands(self, label, candidates):
+        shrunk_label_cands = candidates.copy()
+        shrunk_label_cands.remove(label)# remove the candidate with specific label (the correct one)
+        shrunk_label_cands = random.sample(shrunk_label_cands, k=self.args.n_candidates-1)# get a number of candidate from the original one
+        shrunk_label_cands.append(label) # add back correct one
+        random.shuffle(shrunk_label_cands)
+
+        return shrunk_label_cands
+
+    def collate_fn(self, batch):# get the attributes of the input batch
+        input_ids = [ids for ins in batch for ids in ins["input_ids"]]
+        token_type_ids = [ids for ins in batch for ids in ins["token_type_ids"]]
+        ## mc_token_ids = [id for ins in batch for id in ins["mc_token_ids"]]
+                            
+        attention_mask =[mask for ins in batch for mask in ins["attention_mask"]] ##
+        label_idx = [[ins["label_idx"] for ins in batch]]
+
+        data_info = {
+            "dialog_ids": [ins["dialog_id"] for ins in batch],
+            "candidate_keys": [ins["candidate_keys"] for ins in batch]
+        }
+
+        batch_size = len(batch)
+        n_candidates = len(batch[0]["input_ids"])
+        input_ids = torch.tensor(
+            pad_ids(input_ids, self.pad)
+        ).view(batch_size, n_candidates, -1)
+        
+        token_type_ids = torch.tensor(
+            pad_ids(token_type_ids, self.pad)
+        ).view(batch_size, n_candidates, -1)
+
+        attention_mask = torch.tensor( ## 
+            pad_ids(attention_mask, self.pad) ##
+        ).view(batch_size, n_candidates, -1) ##
+                
+        lm_labels = torch.full_like(input_ids, -100)
+        ## mc_token_ids = torch.tensor(mc_token_ids).view(batch_size, n_candidates)
+        label_idx = torch.tensor(label_idx)
+
+        return input_ids, token_type_ids,\
+          lm_labels, label_idx,\
+          attention_mask,\
+          data_info ##

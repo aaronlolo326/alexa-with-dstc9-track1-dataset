@@ -1,7 +1,7 @@
 import torch
 import torch.nn.functional as F
 import logging
-
+from pprint import pprint
 
 logger = logging.getLogger(__name__)
 
@@ -102,6 +102,36 @@ def run_batch_selection_train(args, model, batch):
     mc_loss = model_outputs[0]
     lm_logits, mc_logits = model_outputs[1], model_outputs[2]
     return mc_loss, lm_logits, mc_logits, mc_labels
+   
+def run_batch_selection_train_bertMC(args, model, batch):
+    batch = tuple(input_tensor.to(args.device) for input_tensor in batch if isinstance(input_tensor, torch.Tensor))
+    input_ids, token_type_ids, label_idx, attention_mask = batch
+    model_outputs = model(
+        input_ids=input_ids, token_type_ids=token_type_ids,
+        attention_mask=attention_mask, labels=label_idx
+    )
+    mc_loss = model_outputs[0]
+    mc_logits = model_outputs[1]
+    return mc_loss, mc_logits, label_idx
+    
+    
+def run_batch_selection_train_bertSeqCls(args, model, batch):
+    batch = tuple(input_tensor.to(args.device) for input_tensor in batch if isinstance(input_tensor, torch.Tensor))
+    input_ids, token_type_ids, lm_labels, cls_labels, attention_mask = batch ##
+    for input_id in input_ids:
+      print (input_id)
+    print (cls_labels)
+    input()
+    model_outputs = model(
+        labels=cls_labels, ##
+        input_ids=input_ids,
+        token_type_ids=token_type_ids,
+        attention_mask=attention_mask,
+    )
+    cls_loss = model_outputs[0] ##
+    cls_logits, hidden_states, attentions = model_outputs[1], model_outputs[2], model_outputs[3] ##
+    return cls_loss, cls_logits, hidden_states, attentions, cls_labels ##
+
 
 
 def run_batch_selection_eval(args, model, batch):
@@ -120,14 +150,45 @@ def run_batch_selection_eval(args, model, batch):
     all_mc_logits = torch.cat(all_mc_logits, dim=0).unsqueeze(0)
     return torch.tensor(0.0), torch.tensor([]), all_mc_logits, mc_labels
 
+def run_batch_selection_eval_bertMC(args, model, batch):
+    candidates_per_forward = args.max_candidates_per_forward_eval * (args.n_gpu if isinstance(model, torch.nn.DataParallel) else 1)
+    batch = tuple(input_tensor.to(args.device) for input_tensor in batch if isinstance(input_tensor, torch.Tensor))
+    input_ids, token_type_ids, label_idx, attention_mask = batch
+    all_mc_logits = []
+    for index in range(0, input_ids.size(1), candidates_per_forward):
+        model_outputs = model(
+            input_ids=input_ids[0, index:index+candidates_per_forward].unsqueeze(1),
+            token_type_ids=token_type_ids[0, index:index+candidates_per_forward].unsqueeze(1),
+            attention_mask=attention_mask[0, index:index+candidates_per_forward].unsqueeze(1)
+        )
+        mc_logits = model_outputs[1]
+        all_mc_logits.append(mc_logits.detach())
+    all_mc_logits = torch.cat(all_mc_logits, dim=0).unsqueeze(0)
+    return torch.tensor(0.0), torch.tensor([]), all_mc_logits, label_idx
+
+def run_batch_selection_eval_bertSeqCls(args, model, batch):
+    candidates_per_forward = args.max_candidates_per_forward_eval * (args.n_gpu if isinstance(model, torch.nn.DataParallel) else 1)
+    batch = tuple(input_tensor.to(args.device) for input_tensor in batch if isinstance(input_tensor, torch.Tensor))
+    input_ids, token_type_ids, _, cls_labels, attention_mask = batch ##
+    all_mc_logits = []
+    for index in range(0, input_ids.size(1), candidates_per_forward):
+        model_outputs = model(
+            input_ids=input_ids[0, index:index+candidates_per_forward].unsqueeze(1),
+            token_type_ids=token_type_ids[0, index:index+candidates_per_forward].unsqueeze(1),
+            attention_mask=attention_mask[0, index:index+candidates_per_forward].unsqueeze(1)
+        )
+        cls_logits = model_outputs[1]
+        all_cls_logits.append(cls_logits.detach())
+    all_cls_logits = torch.cat(all_cls_logits, dim=0).unsqueeze(0)
+    return torch.tensor(0.0), torch.tensor([]), all_cls_logits, cls_labels
+
 
 def run_batch_detection(args, model, batch):
     batch = tuple(input_tensor.to(args.device) for input_tensor in batch if isinstance(input_tensor, torch.Tensor))
-    input_ids, token_type_ids, mc_token_ids, lm_labels, labels = batch
+    input_ids, token_type_ids, mc_token_ids, lm_labels, labels, attention_mask = batch
     model_outputs = model(
-        input_ids=input_ids, token_type_ids=token_type_ids,
-        mc_token_ids=mc_token_ids, labels=labels
+        input_ids=input_ids, token_type_ids= None, attention_mask=None, labels=labels.long() ##
     )
     cls_loss = model_outputs[0]
-    lm_logits, cls_logits = model_outputs[1], model_outputs[2]
-    return cls_loss, lm_logits, cls_logits, labels
+    cls_logits = model_outputs[1] ##
+    return cls_loss, cls_logits, labels ##
